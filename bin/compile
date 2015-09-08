@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir>
+
+# fail fast
+set -e
+
+logger -p user.notice -t "slugc[$$]" "language_pack_java java_compile_start"
+
+BIN_DIR=$(cd $(dirname $0); pwd) # absolute path
+# parse args
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+LOGGER_FLAGS=""
+
+curl --silent --location http://heroku-jvm-common.s3.amazonaws.com/jvm-buildpack-common.tar.gz | tar xz
+. bin/java
+
+KEEP_M2_CACHE="true"
+
+if [ ! -d $CACHE_DIR ]; then
+  KEEP_M2_CACHE="false"
+elif [ -f $CACHE_DIR/removeM2Cache ]; then
+  KEEP_M2_CACHE="false"
+fi
+
+if [ "true" == $KEEP_M2_CACHE ]; then
+  logger -p user.notice -t "slugc[$$]" "language_pack_java retain_m2_repo"
+fi
+
+#create the cache dir if it doesn't exist
+mkdir -p $CACHE_DIR
+
+# create default system.properties 
+if [ ! -f ${BUILD_DIR}/system.properties ]; then
+  echo "java.runtime.version=1.6" > ${BUILD_DIR}/system.properties
+fi
+
+###Start Install NodeJs
+
+# Download node from Heroku's S3 mirror of nodejs.org/dist
+node_url="http://s3pository.heroku.com/node/v0.10.25/node-v0.10.25-linux-x64.tar.gz"
+curl $node_url -s -o - | tar xzf - -C $BUILD_DIR
+
+# Move node (and npm) into ./vendor and make them executable
+mkdir -p $BUILD_DIR/vendor
+echo -n "-----> Installing Node v0.10.25..."
+mv $BUILD_DIR/node-v0.10.25-linux-x64 $BUILD_DIR/vendor/node
+chmod +x $BUILD_DIR/vendor/node/bin/*
+export PATH="$BUILD_DIR/vendor/node/bin:$PATH"
+
+### Finish Install NodeJs
+
+### Start install phantomjs
+PHANTOM_JS_URL="https://bitbucket.org/ariya/phantomjs/downloads/phantomjs-1.9.8-linux-x86_64.tar.bz2"
+echo "-----> Installing phantomjs...."
+curl --silent --max-time 60 --location $PHANTOM_JS_URL | tar xjf - -C $BUILD_DIR
+mv $BUILD_DIR/phantomjs-1.9.8-linux-x86_64 $BUILD_DIR/vendor/phantomjs
+chmod +x $BUILD_DIR/vendor/phantomjs/bin/*
+echo " done"
+### End install phantomjs
+
+# install JDK 
+javaVersion=$(detect_java_version ${BUILD_DIR})
+echo -n "-----> Installing OpenJDK ${javaVersion}..."
+install_java ${BUILD_DIR} ${javaVersion}
+jdk_overlay ${BUILD_DIR}
+echo " done"
+
+
+# change to cache dir to install maven
+cd $CACHE_DIR
+
+# Install and start zinc 
+ZINC_URL="http://downloads.typesafe.com/zinc/0.3.7/zinc-0.3.7.tgz"
+
+if [ ! -d .zinc ]; then
+  echo -n "-----> Installing Zinc..."
+  curl --silent --max-time 60 --location $ZINC_URL | tar xz
+  mv zinc-0.3.7 .zinc
+  mkdir -p .zinc/cache
+  chmod +x -R .zinc/bin/*
+  echo " done"
+fi
+
+ZINC_START_CMD=".zinc/bin/zinc -d .zinc/cache -nailed -start"
+$ZINC_START_CMD
+### end of install and start zinc
+
+
+# install maven with base repository
+MAVEN_URL="http://archive.apache.org/dist/maven/maven-3/3.2.1/binaries/apache-maven-3.2.1-bin.tar.gz"
+
+if [ ! -d .maven ]; then
+  echo -n "-----> Installing Maven 3.2.1..."
+  curl --max-time 60 --location $MAVEN_URL | tar xz
+  mv apache-maven-3.2.1 .maven
+  chmod +x .maven/bin/mvn
+  echo " done"
+fi
+
+MAVEN_SETTINGS_URL="https://raw.githubusercontent.com/kredito/heroku-buildpack-java/nexus_auth/opt/settings.xml"
+export NEXUS_READER_PWD=$(cat $ENV_DIR/NEXUS_READER_PWD)
+echo -n "-----> Installing settings.xml..."
+if [ -f .m2/settings.xml ]; then
+  rm .m2/settings.xml 
+fi
+
+if [ ! -d .m2 ]; then 
+  echo -n "Making dir .m2... "
+  mkdir .m2
+fi 
+
+curl --max-time 10 --location $MAVEN_SETTINGS_URL --output .m2/settings.xml
+echo " done"
+
+# change to build dir to run maven
+cd $BUILD_DIR
+
+export MAVEN_OPTS="-Xmx1024m"
+
+
+# check if DB is up to date
+if [ -f $ENV_DIR/DATABASE_URL ] && [ -f db/pom.xml ]; then # This buildback can be used for apps other then LPA (e.g. clerk)
+    echo "------> checking if DB is up to date"
+    DB_URL=$(cat $ENV_DIR/DATABASE_URL)
+
+    DB_URL_PARTS=( $(echo $DB_URL | sed 's/postgres:\/\/\([[:alnum:]]\+\):\([[:alnum:]]\+\)@\([^:/]\+:[[:digit:]]\+\/[[:alnum:]]\+\).*/\1 \2 \3/') )
+    DB_USER=${DB_URL_PARTS[0]}
+    DB_PWD=${DB_URL_PARTS[1]}
+    DB_JDBC_URL=jdbc:postgresql://${DB_URL_PARTS[2]}
+    echo JDBC URL=$DB_JDBC_URL
+
+    $CACHE_DIR/.maven/bin/mvn liquibase:updateSQL -f db/pom.xml -Dliquibase.url=$DB_JDBC_URL -Dliquibase.username=$DB_USER -Dliquibase.password=$DB_PWD -B -Duser.home=$BUILD_DIR -Dmaven.repo.local=$CACHE_DIR/.m2/repository -s $CACHE_DIR/.m2/settings.xml
+
+    echo "------> listing dirs:"
+    ls $BUILD_DIR
+
+    UPDATE_SQL_FILE=$BUILD_DIR/db/target/liquibase/migrate.sql
+    if grep -m 1 -q ^\\s\*\\w\\+ "$UPDATE_SQL_FILE"; then
+        echo "-------> DB misses following updates - aborting deploy:"
+        cat $UPDATE_SQL_FILE
+        exit 1
+    elif [ ! -f $UPDATE_SQL_FILE ]; then
+        echo "-------> Buildpack is broken - can't check if DB needs update. Aborting deploy."
+        exit 1
+    else
+        echo "------> DB is up to date, OK to depoy"
+    fi
+fi
+
+
+# build app
+BUILDCMD="$CACHE_DIR/.maven/bin/mvn -B -Duser.home=$BUILD_DIR -Dmaven.repo.local=$CACHE_DIR/.m2/repository -s $CACHE_DIR/.m2/settings.xml -Dmaven.test.skip=true clean install"
+echo "-----> executing $BUILDCMD"
+
+$BUILDCMD 2>&1 | sed -u 's/^/       /'
+
+if [ "${PIPESTATUS[*]}" != "0 0" ]; then
+  echo " !     Failed to build app with Maven"
+  exit 1
+fi
+
+# finalize cache
+if [ "false" == $KEEP_M2_CACHE ]; then
+  touch $CACHE_DIR/removeM2Cache
+fi
+
+#copy .m2, .maven and .zinc if needed
+if [ "true" == $KEEP_M2_CACHE ]; then
+  for DIR in ".m2" ".maven" ".zinc" ; do
+    cp -r $CACHE_DIR/$DIR $DIR
+  done
+fi
+
+PROFILE_PATH="$BUILD_DIR/.profile.d/java.sh"
+mkdir -p $(dirname $PROFILE_PATH)
+echo 'export PATH="/app/.jdk/bin:$PATH"' >> $PROFILE_PATH
+echo 'export JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -Djava.rmi.server.useCodebaseOnly=true"' >> $PROFILE_PATH
+
+logger -p user.notice -t "slugc[$$]" "language_pack_java java_compile_end $LOGGER_FLAGS"
